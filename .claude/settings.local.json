@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/Computer/**)",
+      "Read(//c/Program Files/**)"
+    ]
+  }
+}
