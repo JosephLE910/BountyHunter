@@ -1,0 +1,18 @@
+{
+    "name": "BountyHunter.Physics",
+    "rootNamespace": "BountyHunter.Physics",
+    "references": [
+        "BountyHunter.Shared",
+        "KartGame",
+        "Unity.TextMeshPro"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

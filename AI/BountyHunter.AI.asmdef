@@ -1,0 +1,17 @@
+{
+    "name": "BountyHunter.AI",
+    "rootNamespace": "BountyHunter.AI",
+    "references": [
+        "BountyHunter.Shared",
+        "BountyHunter.Physics"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
