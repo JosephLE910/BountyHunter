@@ -27,8 +27,7 @@ namespace BountyHunter.Network
         /// </summary>
         public void ReceiveState(KartNetState state)
         {
-            // 时间戳用 Unity 网络时间（此处用 Time.time 占位，实际用 NetworkManager.ServerTime）
-            state.Tick = state.Tick; // 已包含服务端 tick
+            // state.Tick 已包含服务端 tick，直接入缓冲
             _buffer.Add(state);
             _extrapolateTimer = 0f;
 

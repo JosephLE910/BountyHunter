@@ -64,6 +64,10 @@ cp "$BH_SRC/Network/"*.cs    "$BH/Network/"
 cp "$BH_SRC/Network/"*.asmdef "$BH/Network/"
 echo "  ✓ Network"
 
+cp "$BH_SRC/Editor/"*.cs     "$BH/Editor/"
+cp "$BH_SRC/Editor/"*.asmdef "$BH/Editor/"
+echo "  ✓ Editor"
+
 echo ""
 echo "=== 同步完成 ==="
 echo "建议接着运行 git add . && git commit 提交变更。"
