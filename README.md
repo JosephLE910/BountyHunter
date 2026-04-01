@@ -212,6 +212,7 @@ if (!m_DriftKeyHeld) canEndDrift = true;
 | `PacejkaDriftD` | 0.35 | 漂移峰值，越小越滑（偏《QQ飞车》） |
 | `DriftSidewaysFriction` | 0.2 | 漂移时横向摩擦力 |
 | `DriftSteerMultiplier` | 1.8 | 漂移转向灵敏度倍率 |
+| `DriftMinSpeedPercent` | 0.2 | 触发漂移所需的最低速度百分比（相对最高速），降低可在低速弯道漂移 |
 | `DriftChargeLevel1/2/3Time` | 0.5 / 1.2 / 2.5s | 三级蓄力时间阈值 |
 | `TurboBoostDuration` | 2.0s | 涡轮持续时间（三级最大） |
 | `TurboSpeedBonus` | 5 m/s | 涡轮速度加成（冲量 + TopSpeed Powerup） |
@@ -320,6 +321,21 @@ if (Mathf.Abs(accelInput) < k_NullInput && GroundPercent > 0.0f && !boostBypassi
 1. 冲量系数从 `0.6f` 提升至 `1.5f`，即时感更强
 2. Powerup 同时加入 `Acceleration = TurboAccelBonus * t`，使车辆更快达到提升后的顶速
 3. 速度上限（`ClampMagnitude`）保持不变，依然通过 `TopSpeed Powerup` 自然限速，不突破物理上限
+
+---
+
+#### 问题 9：主场景弯道多、速度低，漂移难以触发
+**原因：** 原版漂移触发阈值复用了 `MinSpeedPercentToFinishDrift = 0.5`，即需要达到最高速的 50% 才能漂移。测试场景直道多容易达速，但主场景弯道密集，车速普遍偏低，导致几乎无法触发漂移。
+
+**修复：** 新增独立参数 `DriftMinSpeedPercent`（默认 0.2），将触发阈值从 50% 降至 20%，在低速弯道也能正常漂移，同时保留 Inspector 可调性：
+
+```csharp
+// 原版（复用结束阈值）：
+// if ((WantsToDrift || isBraking) && currentSpeed > maxSpeed * MinSpeedPercentToFinishDrift)
+
+// 新版（独立触发阈值）：
+if ((WantsToDrift || isBraking) && currentSpeed > maxSpeed * DriftMinSpeedPercent)
+```
 
 ---
 

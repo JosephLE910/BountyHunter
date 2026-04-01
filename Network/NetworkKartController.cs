@@ -28,8 +28,8 @@ namespace BountyHunter.Network
         [Header("Prediction")]
         [Tooltip("客户端预测缓冲帧数")]
         public int   InputBufferSize     = 64;
-        [Tooltip("位置纠错插值速度（服务端权威纠正时）")]
-        public float CorrectionLerpSpeed = 15f;
+        [Tooltip("位置纠错阈值（米），超过此值才触发回滚，避免抖动")]
+        public float CorrectionThreshold = 0.2f;
 
         [Header("Remote Interpolation")]
         [Tooltip("远程玩家渲染延迟（秒），用于插值平滑")]
@@ -39,9 +39,9 @@ namespace BountyHunter.Network
         private NetworkVariable<KartNetState> _netState = new(
             writePerm: NetworkVariableWritePermission.Server);
 
-        private KartController  _kart;
-        private InputHandler    _input;
-        private ClientPrediction _prediction;
+        private KartController      _kart;
+        private InputHandler        _input;
+        private ClientPrediction    _prediction;
         private InterpolationSystem _interpolation;
 
         private uint _localTick;
@@ -53,23 +53,28 @@ namespace BountyHunter.Network
             _prediction    = GetComponent<ClientPrediction>();
             _interpolation = GetComponent<InterpolationSystem>();
 
+            // 在 NetworkSpawn 时订阅，避免 OnEnable/OnDisable 时序导致回调丢失
+            _netState.OnValueChanged += OnAuthorativeStateReceived;
+
             if (!IsOwner)
             {
                 // 非本地玩家：禁用物理，由插值系统驱动
                 var rb = GetComponent<Rigidbody>();
-                if (rb) rb.isKinematic = true;
-                _interpolation.enabled = true;
-                enabled = false; // 关闭本脚本 Update
+                if (rb != null) rb.isKinematic = true;
+                if (_interpolation != null) _interpolation.enabled = true;
+                // 注意：不能 disable 本组件，否则 OnNetworkDespawn 无法注销回调
             }
+        }
+
+        public override void OnNetworkDespawn()
+        {
+            _netState.OnValueChanged -= OnAuthorativeStateReceived;
         }
 
         private void FixedUpdate()
         {
-            if (!IsSpawned) return;
-
-            if (IsOwner)
-                OwnerFixedUpdate();
-            // 非Owner已通过 InterpolationSystem 处理
+            if (!IsSpawned || !IsOwner) return;
+            OwnerFixedUpdate();
         }
 
         // ─── 本地玩家（Owner）逻辑 ────────────────────────────────────────────
@@ -96,38 +101,31 @@ namespace BountyHunter.Network
         [ServerRpc]
         private void SubmitInputServerRpc(KartInput input)
         {
-            // 服务端执行物理
+            // 服务端执行物理（权威模拟）
             _kart.ApplyInput(input);
 
-            // 广播权威状态
+            // 广播权威状态给所有客户端
             _netState.Value = GetCurrentState();
         }
 
-        // ─── 权威状态接收（Owner 客户端纠错）─────────────────────────────────
-
-        private void OnEnable()
-        {
-            _netState.OnValueChanged += OnAuthorativeStateReceived;
-        }
-
-        private void OnDisable()
-        {
-            _netState.OnValueChanged -= OnAuthorativeStateReceived;
-        }
+        // ─── 权威状态接收 ─────────────────────────────────────────────────────
 
         private void OnAuthorativeStateReceived(KartNetState prev, KartNetState next)
         {
-            if (!IsOwner) return;
+            if (!IsOwner)
+            {
+                // 非本地玩家：将权威状态喂给插值系统，驱动平滑移动
+                _interpolation?.ReceiveState(next);
+                return;
+            }
 
-            // 对比服务端状态与本地预测状态
+            // Owner：对比服务端状态与本地预测，误差过大时回滚重推演
             KartNetState predicted = _prediction.GetStoredState(next.Tick);
             float posError = Vector3.Distance(predicted.Position, next.Position);
 
-            // 误差超过阈值才纠正（避免抖动）
-            if (posError > 0.2f)
+            if (posError > CorrectionThreshold)
             {
                 _prediction.Rollback(next);
-                // 从权威状态重新推演到当前帧
                 _prediction.Replay(_kart, _localTick);
             }
         }

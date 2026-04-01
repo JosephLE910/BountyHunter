@@ -136,6 +136,8 @@ namespace KartGame.KartSystems
         [Tooltip("达到三级蓄力所需漂移时间（粉焰·完美）")]
         public float DriftChargeLevel3Time = 2.5f;
         // ── BountyHunter: 横向摩擦力 + 转向响应 + 涡轮加速 ─────────────────
+        [Tooltip("触发漂移所需的最低速度百分比（相对最高速），降低可在低速弯道也能漂移，默认 0.2）")]
+        public float DriftMinSpeedPercent = 0.2f;
         [Tooltip("漂移时 WheelCollider 横向摩擦力刚度（原版≈1，降低允许侧滑）")]
         public float DriftSidewaysFriction = 0.2f;
         [Tooltip("漂移时转向灵敏度倍率（>1 使反打方向盘更灵敏）")]
@@ -607,7 +609,7 @@ namespace KartGame.KartSystems
                 // BountyHunter: 漂移触发
                 if (!IsDrifting)
                 {
-                    if ((WantsToDrift || isBraking) && currentSpeed > maxSpeed * MinSpeedPercentToFinishDrift)
+                    if ((WantsToDrift || isBraking) && currentSpeed > maxSpeed * DriftMinSpeedPercent)
                     {
                         IsDrifting        = true;
                         m_DriftTurningPower = turningPower + (Mathf.Sign(turningPower) * DriftAdditionalSteer);
