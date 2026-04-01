@@ -142,8 +142,12 @@ namespace KartGame.KartSystems
         public float DriftSteerMultiplier = 1.8f;
         [Tooltip("涡轮加速持续时间（秒），按蓄力等级缩放")]
         public float TurboBoostDuration = 2.0f;
-        [Tooltip("涡轮加速期间最高速度加成（m/s）")]
+        [Tooltip("涡轮期间速度上限加成（m/s）")]
         public float TurboSpeedBonus = 5f;
+        [Tooltip("涡轮期间加速度加成，越大冲向新上限越快，产生'往前猛冲'感")]
+        public float TurboAccelBonus = 20f;
+        [Tooltip("涡轮触发后阻力豁免时间（秒），防止松油门瞬间把冲量抵消")]
+        public float BoostBypassDuration = 0.4f;
         // ────────────────────────────────────────────────────────────────────
 
         [Header("VFX")]
@@ -205,6 +209,7 @@ namespace KartGame.KartSystems
         public int   DriftChargeLevel  { get; private set; } = 0; // 0=无 1=蓝焰 2=橙焰 3=粉焰
         public float TurboTimer        { get; private set; } = 0f; // >0 表示涡轮激活中，UI 直接读此值
         public int   TurboLevel        { get; private set; } = 0;  // 本次涡轮的等级（1/2/3）
+        float m_BoostBypassTimer       = 0f; // 速度上限豁免期：Boost 触发后短暂无视 TopSpeed 限制
         float m_NormalSidewaysFriction = 1f;
         bool  m_DriftKeyHeld           = false;
         readonly List<(GameObject trailRoot, WheelCollider wheel, TrailRenderer trail)> m_DriftTrailInstances = new List<(GameObject, WheelCollider, TrailRenderer)>();
@@ -334,12 +339,14 @@ namespace KartGame.KartSystems
             // apply our powerups to create our finalStats
             TickPowerups();
 
-            // BountyHunter: 涡轮计时器倒计时
+            // BountyHunter: 涡轮计时器 + 速度豁免期倒计时
             if (TurboTimer > 0f)
             {
                 TurboTimer -= Time.fixedDeltaTime;
                 if (TurboTimer <= 0f) { TurboTimer = 0f; TurboLevel = 0; }
             }
+            if (m_BoostBypassTimer > 0f)
+                m_BoostBypassTimer -= Time.fixedDeltaTime;
 
             // apply our physics properties
             Rigidbody.centerOfMass = transform.InverseTransformPoint(CenterOfMass.position);
@@ -534,13 +541,15 @@ namespace KartGame.KartSystems
             newVelocity.y = Rigidbody.velocity.y;
 
             //  clamp max speed if we are on ground
+            bool boostBypassing = m_BoostBypassTimer > 0f;
             if (GroundPercent > 0.0f && !wasOverMaxSpeed)
             {
                 newVelocity = Vector3.ClampMagnitude(newVelocity, maxSpeed);
             }
 
             // coasting is when we aren't touching accelerate
-            if (Mathf.Abs(accelInput) < k_NullInput && GroundPercent > 0.0f)
+            // [BountyHunter] 豁免期内跳过 CoastingDrag，否则松键瞬间阻力会抵消 Boost 冲量
+            if (Mathf.Abs(accelInput) < k_NullInput && GroundPercent > 0.0f && !boostBypassing)
             {
                 newVelocity = Vector3.MoveTowards(newVelocity, new Vector3(0, Rigidbody.velocity.y, 0), Time.fixedDeltaTime * m_FinalStats.CoastingDrag);
             }
@@ -663,16 +672,29 @@ namespace KartGame.KartSystems
                         if (DriftChargeLevel > 0)
                         {
                             float t = DriftChargeLevel / 3f;
-                            // 瞬间冲量：立即感受到加速
-                            Rigidbody.velocity += transform.forward * (TurboSpeedBonus * t * 0.6f);
-                            // 持续涡轮：维持更高速度上限
+
+                            // BountyHunter: 涡轮冲量分两段
+                            // ① 瞬间大冲量（1.5 倍 TurboSpeedBonus）——制造"往前猛冲"的即时感
+                            //    原版 0.6 倍冲量太弱，新版参考《赛博朋克2077》Dash 的瞬间加速感
+                            Rigidbody.velocity += transform.forward * (TurboSpeedBonus * t * 1.5f);
+
+                            // ② 阻力豁免：防止松油门时 CoastingDrag 立即把冲量抵消
+                            m_BoostBypassTimer = BoostBypassDuration;
+
+                            // ③ 持续 Powerup：同时提升 TopSpeed + Acceleration
+                            //    TopSpeed 拉高速度上限，Acceleration 让车快速冲向新上限
+                            //    两者结合才能产生"往前猛冲"而不是"慢慢加速"的感觉
                             AddPowerup(new StatPowerup
                             {
                                 PowerUpID = "DriftTurbo",
                                 MaxTime   = TurboBoostDuration * t,
-                                modifiers = new Stats { TopSpeed = TurboSpeedBonus * t }
+                                modifiers = new Stats
+                                {
+                                    TopSpeed     = TurboSpeedBonus * t,
+                                    Acceleration = TurboAccelBonus * t
+                                }
                             });
-                            // UI 状态：直接暴露涡轮激活时间，避免 UI 猜测
+
                             TurboTimer = TurboBoostDuration * t;
                             TurboLevel = DriftChargeLevel;
                         }

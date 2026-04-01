@@ -21,8 +21,8 @@ git clone https://github.com/zivoy/karting-microgame.git KartingMicrogame
 # 2. 克隆本仓库
 git clone <本仓库地址> BountyHunter
 
-# 3. 一键部署（自动覆盖同名文件 + 添加依赖包）
-bash BountyHunter/deploy.sh KartingMicrogame
+# 3. 同步覆盖（将 BountyHunter 中的核心脚本覆盖到模板对应目录）
+bash BountyHunter/sync.sh KartingMicrogame
 
 # 4. 用 Unity Hub 打开 KartingMicrogame，等待包解析完成后运行
 ```
@@ -35,11 +35,15 @@ BountyHunter/
 ├── AI/         → 模块二：赛车 AI
 ├── Network/    → 模块三：网络同步
 ├── Shared/     → 公共组件
-├── deploy.sh   → 部署脚本
+├── sync.sh     → 同步脚本（将模板改动及各模块脚本备份回仓库）
 └── README.md
 ```
 
-`deploy.sh` 会将各模块脚本复制到模板对应目录，并在 `manifest.json` 中注入 Netcode for GameObjects 依赖。
+`sync.sh` 将 KartingMicrogame 中被修改的模板文件（如 `ArcadeKart.cs`）以及各模块脚本复制回本仓库，保持两侧同步。每次修改模板文件后需手动运行：
+
+```bash
+bash sync.sh "D:/Computer/KartingMicrogame"
+```
 
 ---
 
@@ -57,7 +61,7 @@ BountyHunter/
 | 《QQ飞车》 | 夸张 | 大幅降低横向抓地力，漂移易触发，三段蓄力 Boost 强化爽快感 |
 | 《马里奥赛车》 | 纯 Arcade | 几乎运动学控制，完全服务于游戏性，无真实物理 |
 
-本实现以《极品飞车：集结》的 Pacejka 模型为理论基础，引入《QQ飞车》的漂移蓄力机制，通过 `RealismFactor` 式参数在两端之间调节。
+本实现以《极品飞车：集结》的 Pacejka 模型为理论基础，引入《QQ飞车》的漂移蓄力机制，通过 `PacejkaDriftD`、`DriftSidewaysFriction` 等可调参数在真实感与爽快感之间调节。
 
 ---
 
@@ -147,17 +151,22 @@ m_DriftTurningPower = Mathf.Clamp(
 | Lv.3 | ≥ 2.5s | 粉焰（完美） | 最强 Boost |
 
 涡轮加速由两部分组成：
-- **瞬间冲量**：`Rigidbody.velocity += forward * (TurboSpeedBonus × t × 0.6)`，提供即时手感
-- **持续加速**：通过 `AddPowerup()` 注入 `TopSpeed` 加成 Powerup，维持更高速度上限
+- **瞬间冲量**：`Rigidbody.velocity += forward * (TurboSpeedBonus × t × 1.5)`，提供"向前冲"的即时手感
+- **持续加速**：通过 `AddPowerup()` 注入 `TopSpeed + Acceleration` 双加成 Powerup，维持更高速度上限并缩短达到顶速的时间
 
 ```csharp
 float t = DriftChargeLevel / 3f;
-Rigidbody.velocity += transform.forward * (TurboSpeedBonus * t * 0.6f);
+Rigidbody.velocity += transform.forward * (TurboSpeedBonus * t * 1.5f);
+m_BoostBypassTimer = BoostBypassDuration;
 AddPowerup(new StatPowerup
 {
     PowerUpID = "DriftTurbo",
     MaxTime   = TurboBoostDuration * t,
-    modifiers = new Stats { TopSpeed = TurboSpeedBonus * t }
+    modifiers = new Stats
+    {
+        TopSpeed     = TurboSpeedBonus * t,
+        Acceleration = TurboAccelBonus * t
+    }
 });
 TurboTimer = TurboBoostDuration * t;
 TurboLevel = DriftChargeLevel;
@@ -205,7 +214,9 @@ if (!m_DriftKeyHeld) canEndDrift = true;
 | `DriftSteerMultiplier` | 1.8 | 漂移转向灵敏度倍率 |
 | `DriftChargeLevel1/2/3Time` | 0.5 / 1.2 / 2.5s | 三级蓄力时间阈值 |
 | `TurboBoostDuration` | 2.0s | 涡轮持续时间（三级最大） |
-| `TurboSpeedBonus` | 5 m/s | 涡轮速度加成 |
+| `TurboSpeedBonus` | 5 m/s | 涡轮速度加成（冲量 + TopSpeed Powerup） |
+| `TurboAccelBonus` | 20 | 涡轮加速度加成（Powerup，缩短达顶速时间） |
+| `BoostBypassDuration` | 0.4s | 涡轮冲量后的 CoastingDrag 免疫时间，防止松 W 立即抵消冲量 |
 
 ---
 
@@ -284,6 +295,31 @@ TurboLevel = DriftChargeLevel;
 // DriftBoostUI.cs
 if (Kart.TurboTimer > 0f) { /* 显示闪烁 */ }
 ```
+
+---
+
+#### 问题 7：涡轮冲量被 CoastingDrag 立即抵消
+**原因：** `ArcadeKart` 在未踩油门（`accelInput ≈ 0`）时会施加 `CoastingDrag` 减速力。涡轮触发时玩家往往已松开刹车键，但还未来得及按油门，导致冲量在同一帧被抵消，完全感受不到加速。
+
+**修复：** 新增 `m_BoostBypassTimer`，涡轮触发时置为 `BoostBypassDuration`（0.4s），在此期间跳过 CoastingDrag：
+
+```csharp
+bool boostBypassing = m_BoostBypassTimer > 0f;
+if (Mathf.Abs(accelInput) < k_NullInput && GroundPercent > 0.0f && !boostBypassing)
+{
+    // CoastingDrag 仅在未 Boost 时施加
+}
+```
+
+---
+
+#### 问题 8：涡轮冲量感不强，缺少"向前冲"的感觉
+**原因：** 初始冲量系数为 `0.6f`，叠加的 Powerup 只有 `TopSpeed` 加成，加速度不变导致达到新顶速很慢，整体手感"软"。
+
+**修复：**
+1. 冲量系数从 `0.6f` 提升至 `1.5f`，即时感更强
+2. Powerup 同时加入 `Acceleration = TurboAccelBonus * t`，使车辆更快达到提升后的顶速
+3. 速度上限（`ClampMagnitude`）保持不变，依然通过 `TopSpeed Powerup` 自然限速，不突破物理上限
 
 ---
 
