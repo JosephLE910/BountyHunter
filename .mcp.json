@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "unityMCP": {
+      "type": "stdio",
+      "command": "C:/Users/A/AppData/Local/Programs/Python/Python313/Scripts/uv.exe",
+      "args": ["run", "--directory", "D:/Computer/unity-mcp/Server", "python", "src/main.py", "--transport", "stdio"]
+    }
+  }
+}

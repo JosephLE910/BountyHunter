@@ -343,6 +343,276 @@ if ((WantsToDrift || isBraking) && currentSpeed > maxSpeed * DriftMinSpeedPercen
 
 > 待编写
 
-## 模块三：网络同步
+## 模块三：网络同步与多人对战
 
-> 待编写
+### 核心研究问题
+
+任务书的核心问题是：**如何在网络延迟和丢包的情况下，为所有玩家提供流畅、公平的竞速体验？**
+
+---
+
+### 技术选型：状态同步 vs 帧同步
+
+| 维度 | 帧同步 | 状态同步 |
+|------|--------|----------|
+| 一致性 | 所有客户端结果完全相同 | 每客户端独立模拟，存在误差 |
+| 碰撞精度 | 精确，适合需要精确碰撞的游戏（如《火箭联盟》） | 不一致，对方车辆位置为预测/插值结果 |
+| 网络容错 | 差——一个客户端卡顿会阻塞所有人 | 好——每端独立运行，延迟只影响视觉同步 |
+| 带宽 | 仅传输输入（极小），但需严格对齐 tick | 传输完整状态（较大），但可以限速 |
+| 适用场景 | PC 稳定网络（《星际争霸》《火箭联盟》） | 移动端/不稳定网络（《极品飞车：集结》） |
+
+**本实现选择状态同步**，理由与《极品飞车：集结》相同：
+- 赛车游戏对碰撞精度要求低于格斗/MOBA（擦碰不影响胜负）
+- 局域网/移动端网络不稳定，帧同步的"全体等最慢者"代价过高
+- 状态同步配合插值，对手车辆的视觉表现已足够流畅
+
+---
+
+### 架构设计
+
+```
+[Host / Server]                    [Client]
+  ArcadeKart (物理权威)               ArcadeKart (kinematic，不运算物理)
+  NetworkArcadeKartController         NetworkArcadeKartController
+    FixedUpdate → CaptureState()        OnValueChanged → ReceiveState()
+    _netState.Value = state             InterpolationSystem.Update()
+                                          Lerp(older, newer, t)
+                                          Extrapolate(velocity * dt)
+```
+
+使用 **Unity Netcode for GameObjects 1.x**（NGO），采用**客户端权威（Owner Write）**模型：
+- 每个玩家对自己的车有写权限（`NetworkVariableWritePermission.Owner`）
+- 以 20Hz（`SendRate = 0.05s`）广播状态快照给所有其他玩家
+- 非 Owner 玩家的 `Rigidbody` 设为 Kinematic，完全由插值系统驱动，不参与物理运算
+
+> 注：`NetworkKartController` 实现了完整的**服务端权威 + 客户端预测 + 回滚**架构（见下文），但因其依赖自定义 `KartController` 物理，与 Karting Microgame 原版 `ArcadeKart` 不兼容，实际运行使用的是 `NetworkArcadeKartController`（客户端权威简化版）。
+
+---
+
+### 延迟补偿实现
+
+#### 1. 插值（Interpolation）— `InterpolationSystem.cs`
+
+核心思路：渲染时刻**主动落后**真实时间 `InterpolationDelay`（默认 100ms），在缓冲区的两条快照之间插值，消除因网络抖动导致的位置跳变。
+
+```csharp
+// 找最后两条快照，按 tick 差估算时间区间
+float duration = (newer.Tick - older.Tick) * Time.fixedDeltaTime;
+float t = Mathf.Clamp01((Time.time - renderTime) / duration);
+
+transform.position = Vector3.Lerp(older.Position, newer.Position, t);
+transform.rotation = Quaternion.Slerp(older.Rotation, newer.Rotation, t);
+```
+
+**弱网降级：外推（Extrapolation）**
+
+当缓冲区快照不足（包丢失或延迟过大）时，切换为外推模式：用最后一条快照的速度向量推算当前位置，最多外推 `MaxExtrapolateTime`（500ms），超时则停止等待下一个快照：
+
+```csharp
+transform.position += _lastState.Velocity * dt;
+```
+
+#### 2. 客户端预测（Client Prediction）— `ClientPrediction.cs`
+
+`NetworkKartController` 中实现的完整预测-回滚机制（服务端权威版本）：
+
+1. **本地立即执行**：Owner 收到输入后不等服务端，直接在本地运行物理，消除操控延迟
+2. **存入预测缓冲**：将每帧的输入和预测状态按 tick 存入环形缓冲区
+3. **接收权威状态**：服务端广播的 `KartNetState` 到达后，比对本地预测
+4. **回滚重推演（Rollback & Replay）**：若误差超过 `CorrectionThreshold`（默认 0.2m），从权威状态重新推演所有尚未确认的帧：
+
+```csharp
+float posError = Vector3.Distance(predicted.Position, next.Position);
+if (posError > CorrectionThreshold)
+{
+    _prediction.Rollback(next);       // 将状态回退到权威快照
+    _prediction.Replay(_kart, _localTick); // 重推演所有未确认输入
+}
+```
+
+这套机制参考了《Replicating Chaos: Vehicle Replication in Watch Dogs 2》（GDC）的思路：车辆物理高度非线性，单纯插值不够，必须结合物理重推演才能保证纠错后运动连贯。
+
+---
+
+### 同步数据结构
+
+```csharp
+public struct KartNetState : INetworkSerializable
+{
+    public uint       Tick;       // 物理帧序号，用于插值排序和预测对齐
+    public Vector3    Position;
+    public Quaternion Rotation;
+    public Vector3    Velocity;   // 用于外推
+    public Vector3    AngularVel; // 用于旋转外推
+}
+```
+
+每条状态包 **52 字节**（4+12+16+12+12），20Hz 下单玩家上行约 **8 KB/s**，局域网环境完全可接受。
+
+---
+
+### 局域网房间发现 — `LANDiscovery.cs`
+
+不依赖中央服务器，通过 **UDP 子网广播**实现自动房间发现：
+
+```
+Host → 每 2s 向 x.x.x.255:47777 广播 "BountyHunter|<hostIP>|<gamePort>"
+     → 同时向 127.0.0.1:47777 发送（确保同机测试可用）
+Client → 后台线程监听 :47777 → 解析消息 → 主线程回调 OnRoomFound
+```
+
+**关键细节：**
+- 使用子网定向广播（`x.x.x.255`）而非 `255.255.255.255`，穿透性更好
+- Host 自身通过 `_broadcasting && hostIP == _localIP` 过滤自己的广播（仅自己作为 Host 时过滤，纯 Client 不过滤）
+- 后台线程到主线程回调通过 `MainThreadDispatcher`（Queue + lock）传递，符合 Unity 单线程模型
+
+---
+
+### 遇到的问题及修复记录
+
+#### 问题 1：NGO 版本与 Unity 2022 不兼容
+**现象：** 配置 `com.unity.netcode.gameobjects: 2.4.0` 后项目无法打开，提示版本要求。
+
+**原因：** NGO 2.x 要求 Unity 6，Unity 2022.3 LTS 最高兼容 1.x。
+
+**修复：** `manifest.json` 降级为 `1.12.0`。
+
+---
+
+#### 问题 2：NetworkVariable 序列化报错
+**错误：** `NetworkBehaviourILPP: Don't know how to serialize BountyHunter.Shared.KartInput`
+
+**原因：** NGO 的 ILPP 要求 ServerRpc 参数实现序列化接口，普通 struct 不满足。
+
+**修复：** 对仅含基础类型的结构体实现 `INetworkSerializeByMemcpy`，直接按内存布局拷贝，无需手写序列化：
+
+```csharp
+public struct KartInput : INetworkSerializeByMemcpy { ... }
+```
+
+---
+
+#### 问题 3：非 Owner 玩家的车被本地物理驱动，两端位置不一致
+**原因：** 非本地玩家的 `ArcadeKart` 仍持有活跃的 `Rigidbody`，本地物理引擎会持续施力，导致其位置与插值结果冲突，出现抖动和传送现象。
+
+**修复：** `OnNetworkSpawn` 中，非 Owner 玩家的 `Rigidbody.isKinematic = true`，同时禁用 `KeyboardInput`（`BaseInput.enabled = false`），使 Transform 完全由 `InterpolationSystem` 控制：
+
+```csharp
+if (!IsOwner)
+{
+    var keyInput = GetComponent<BaseInput>();
+    if (keyInput != null) keyInput.enabled = false;
+    var rb = _kart.Rigidbody;
+    if (rb != null) rb.isKinematic = true;
+    _interpolation.enabled = true;
+}
+```
+
+---
+
+#### 问题 4：多人模式下车辆出生在赛道外
+**原因：** NGO 的 PlayerPrefab 在服务端 Spawn 时使用 Prefab 原始位置（世界原点附近），未对接场景中的出生点。
+
+**修复：** 在 `OnNetworkSpawn` 的 Owner 分支中，按 `OwnerClientId % 8` 查找场景内名为 `SpawnPoint_0`、`SpawnPoint_1` 等的 Transform，同时更新 `Rigidbody.position` 和 `transform`，防止物理位置与视觉位置不一致：
+
+```csharp
+rb.position = spawnPoint.position;
+rb.rotation = spawnPoint.rotation;
+rb.velocity = rb.angularVelocity = Vector3.zero;
+transform.SetPositionAndRotation(spawnPoint.position, spawnPoint.rotation);
+```
+
+---
+
+#### 问题 5：Host 自己能搜索到自己的房间
+**原因：** Host 在监听状态时收到了自己发出的广播包（Windows 会将广播包回环给同一机器的所有 UDP socket）。
+
+**修复：** `ParseAndNotify` 中判断：如果 `_broadcasting`（即自己是 Host），则过滤与本机 IP 相同的广播：
+
+```csharp
+if (_broadcasting && hostIP == _localIP) return;
+```
+
+---
+
+#### 问题 6：同一台机器上 Client 搜不到 Host
+**原因：** Windows 不会将广播包回环给同一机器的其他进程（只回环给同一 socket），导致 exe 中的 Client 收不到编辑器 Host 的广播。
+
+**修复：** Host 广播时额外向 `127.0.0.1` 发送一条相同内容的单播，确保同机进程可以收到：
+
+```csharp
+// 子网广播（给局域网其他机器）
+_broadcaster.Send(data, data.Length, new IPEndPoint(GetSubnetBroadcast(_localIP), DiscoveryPort));
+// loopback 单播（给同机其他进程）
+_broadcaster.Send(data, data.Length, new IPEndPoint(IPAddress.Loopback, DiscoveryPort));
+```
+
+---
+
+#### 问题 7：两台电脑联机时 Client 搜不到 Host
+**原因：** 两台机器连接同一 WiFi 时，路由器可能开启了 **AP 隔离（AP Isolation）**，阻止同一 WiFi 下设备间的直接通信，UDP 广播被完全屏蔽。
+
+**排查方法：** 先用 `ping <HostIP>` 确认两机是否能互通，不通则为 AP 隔离。
+
+**解决方法：**
+1. 登录路由器管理页面，关闭「AP 隔离」/「无线隔离」
+2. 两台机器均开放 UDP 47777（发现）和 TCP 7777（游戏）端口的 Windows 防火墙入站规则：
+```powershell
+netsh advfirewall firewall add rule name="BountyHunter UDP" protocol=UDP dir=in localport=47777 action=allow
+netsh advfirewall firewall add rule name="BountyHunter TCP" protocol=TCP dir=in localport=7777 action=allow
+```
+
+---
+
+#### 问题 8：重新打开项目进入 Safe Mode — BountyHunterSetup.cs 引用已删除字段
+**错误：**
+```
+'GameModeSelector' does not contain a definition for 'JoinButton'
+'GameModeSelector' does not contain a definition for 'IpField'
+```
+
+**原因：** `GameModeSelector.cs` 重写时删除了手动输入 IP 的 `JoinButton`、`IpField` 字段（改为 LAN 自动发现），但 Editor 工具脚本 `BountyHunterSetup.cs` 仍在为这两个字段赋值。
+
+**修复：** 同步更新 `BountyHunterSetup.cs`，删除 `JoinButton`/`IpField` 的创建与连线代码，改为创建 `RoomListContent`（VerticalLayoutGroup 容器）并连接到 `selector.RoomListContent`。
+
+**教训：** Editor 工具脚本与运行时组件字段必须同步修改，否则每次 Reimport 都会进入 Safe Mode，工程无法正常打开。
+
+---
+
+#### 问题 9：远端玩家移动卡顿、不流畅
+**现象：** 联机时对方的车辆每隔一段时间跳一下，帧间几乎不动。
+
+**原因：** `InterpolationSystem` 中插值进度 `t` 的计算有根本性错误：
+
+```csharp
+float renderTime = Time.time - InterpolationDelay;
+float t = Mathf.Clamp01((Time.time - renderTime) / duration);
+// 展开后：t = InterpolationDelay / duration
+// 这是一个常数，不随时间变化！
+```
+
+`t` 固定不变，所以每帧位置相同，只有收到新快照时才发生跳变。
+
+**修复：** 为每条入站快照记录本地到达时间戳（`ArrivalTime = Time.time`），插值时用 `renderTime` 在两条快照的到达时间之间做比例：
+
+```csharp
+float span = newer.ArrivalTime - older.ArrivalTime;
+float t = Mathf.Clamp01((renderTime - older.ArrivalTime) / span);
+// t 随 Time.time 线性增长，每帧平滑推进
+```
+
+---
+
+#### 问题 10：同机测试时两个进程互相搜不到
+**现象：** 修复插值后重新测试，同一台机器上编辑器和 exe 无法互相发现房间。
+
+**原因：** 两个进程进入多人界面时都调用 `StartListening()`，各自尝试绑定 UDP `47777` 端口。Windows 默认不允许两个进程同时绑定同一端口，第二个进程绑定失败（`_listening` 被置为 `false`），后续 Host 发出的 loopback 单播无人接收。
+
+**修复：** 创建 listener socket 时设置 `SO_REUSEADDR`，允许多进程共享同一端口：
+
+```csharp
+var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+socket.Bind(new IPEndPoint(IPAddress.Any, DiscoveryPort));
+_listener = new UdpClient { Client = socket, EnableBroadcast = true };
+```

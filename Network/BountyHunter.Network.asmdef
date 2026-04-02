@@ -4,6 +4,7 @@
     "references": [
         "BountyHunter.Shared",
         "BountyHunter.Physics",
+        "KartGame",
         "Unity.Netcode.Runtime",
         "Unity.TextMeshPro",
         "Unity.Networking.Transport"
